@@ -1,11 +1,11 @@
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Union
 
 import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
+from torch._dynamo.variables import UserFunctionVariable
 from torch._higher_order_ops.utils import (
     _has_potential_branch_input_mutation,
-    autograd_not_implemented,
     UnsupportedAliasMutationException,
 )
 from torch._ops import HigherOrderOperator
@@ -95,12 +95,6 @@ def sdpa_dense(
     out, lse = math_attention(query, key, value, score_mod, *other_buffers)
     out = out.contiguous()
     return out, lse
-
-
-# TODO We need to implement an autograd function for this, there is some complexity to do this generically
-templated_attention.py_impl(DispatchKey.Autograd)(
-    autograd_not_implemented(templated_attention, deferred_error=True)
-)
 
 
 def trace_templated_attention(
@@ -218,3 +212,195 @@ def templated_attention_fake_tensor_mode(
             batch_size, num_heads, seq_len_q, dtype=torch.float32
         )
         return torch.empty_like(query, memory_format=torch.contiguous_format), logsumexp
+
+
+# ---------------------------- Autograd Implementation ----------------------------
+# # TODO We need to implement an autograd function for this, there is some complexity to do this generically
+# templated_attention.py_impl(DispatchKey.Autograd)(
+#     autograd_not_implemented(templated_attention, deferred_error=True)
+# )
+
+from torch._dispatch.python import suspend_functionalization
+from torch._functorch.aot_autograd import (
+    AOTConfig,
+    create_joint,
+    default_partition,
+    from_fun,
+)
+
+from torch._subclasses.functional_tensor import (
+    disable_functional_mode,
+    FunctionalTensor,
+)
+from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
+
+# from torch._higher_order_ops.utils import _unstack_pytree, _stack_pytree
+
+
+dummy_aot_config = AOTConfig(
+    fw_compiler=None,  # type: ignore[arg-type]
+    bw_compiler=None,  # type: ignore[arg-type]
+    partition_fn=None,  # type: ignore[arg-type]
+    decompositions={},
+    num_params_buffers=0,
+    aot_id=0,
+    keep_inference_input_mutations=False,
+)
+
+
+def create_fw_bw_graph(
+    score_mod: Union[Callable, UserFunctionVariable], index_values, other_buffers
+):
+    # Note: We create "clean" environments for make_fx by suspending all dispatch keys
+    # between Autograd and Python key. Currently, we only suspend functionalization but more can be
+    # added when required. Will encounter two problems if we don't suspend functionalization:
+    #
+    # 1. make_fx fails to capture operations on input: the inputs are wrapped as _to_functional_tensor_wrapper,
+    # but they will be unwrapped before entering ProxyTorchDispatchMode as part of the dispatching.
+    # However, it's the outside wrapper that tracer creates proxies for. This casuses tracer fail to
+    # fetch the proxy for the inputs and fail to capture any operations on them.
+    #
+    # 2. make_fx fails to capture output: the outputs after ProxyTorchDispatchMode are further
+    # wrapped as FunctionalTensorWrapper in Functionalize key after return. However, the tracer
+    # only associates the inner tensor with proxy in ProxyTorchDispatchMode. Therefore,
+    # when creating the output node, it fails to associate the wrapped tensor with its proxy.
+    # Instead, it will create _tensor_constant as output.
+
+    with suspend_functionalization(), disable_functional_mode():
+        with disable_proxy_modes_tracing():
+            assert (
+                len(other_buffers) == 0
+            ), "Other buffers are not yet supported. We will properly generate the graph for them later."
+
+            def _from_fun(t):
+                if isinstance(t, torch.Tensor):
+                    if t.dtype != torch.bool:
+                        return torch.empty_strided(
+                            t.size(),
+                            t.stride(),
+                            dtype=t.dtype,
+                            requires_grad=t.requires_grad,
+                        )
+                    else:
+                        # clone of a functional tensor produces a functional tensor
+                        # but we want to avoid it so we clone a non-functional version
+                        maybe_unfunc_t = t
+                        if isinstance(t, FunctionalTensor):
+                            torch._sync(t)
+                            maybe_unfunc_t = from_fun(t)
+                        elif torch._is_functional_tensor(t):
+                            # need to handle both types of functionalization here:
+                            # these are the tensors that came from the user,
+                            # which could be either FunctionalTensorWrapper or FunctionalTensor
+                            torch._sync(t)
+                            maybe_unfunc_t = torch._from_functional_tensor(t)
+                        return maybe_unfunc_t.clone()
+                return t
+
+            # See Note:[TemplatedAttention out example value]
+            score_mod = (
+                score_mod.fn
+                if isinstance(score_mod, UserFunctionVariable)
+                else score_mod
+            )
+
+            unwrapped_score_mod_indexes = pytree.tree_map(_from_fun, index_values)
+            unwrapped_other_buffers = pytree.tree_map(_from_fun, other_buffers)
+            example_flat_out = pytree.tree_map(
+                _from_fun,
+                score_mod(*unwrapped_score_mod_indexes, *unwrapped_other_buffers),
+            )
+            if not isinstance(example_flat_out, torch.Tensor):
+                raise RuntimeError(
+                    "Expected output of score_mod to be a tensor."
+                    f"Got type {type(example_flat_out)}."
+                )
+            example_grad = _from_fun(example_flat_out)
+
+            fw_graph = make_fx(score_mod)(
+                *unwrapped_score_mod_indexes, *unwrapped_other_buffers
+            )
+
+        def joint_f(index_values, other_buffers, example_grad):
+            def fw_with_masks(*args):
+                fw_out = score_mod(*args)
+                out_requires_grad = fw_out.requires_grad
+                return ((fw_out,), (out_requires_grad,))
+
+            joint = create_joint(fw_with_masks, aot_config=dummy_aot_config)
+            args = index_values + list(other_buffers)
+            optional_grad = [example_grad] if example_grad.requires_grad else []
+            _, grads = joint(args, optional_grad)
+
+            # In order to keep map functional for backward graph,
+            # we clone outputs that are aliasing inputs
+            # input_storage = {
+            #     StorageWeakRef(arg._typed_storage())
+            #     for arg in example_args
+            #     if isinstance(arg, torch.Tensor)
+            # }
+
+            return grads
+            # return pytree.tree_map(maybe_clone, grads)
+
+        joint_graph = make_fx(joint_f)(
+            unwrapped_score_mod_indexes, unwrapped_other_buffers, example_grad
+        )
+        fwd_graph, bwd_graph = default_partition(
+            joint_graph,
+            (unwrapped_score_mod_indexes, unwrapped_other_buffers, example_grad),
+            num_fwd_outputs=1,
+        )
+        return fw_graph, joint_graph
+
+
+# from torch._higher_order_ops.map import create_fw_bw_graph
+class TemplatedAttentionAutogradOp(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, fw_graph, joint_graph, query, key, value, score_mod, *other_buffers
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ctx.save_for_backward(query, key, value, *other_buffers)
+        ctx._fw_graph = fw_graph
+        ctx._joint_graph = joint_graph
+        # ctx._num_mapped_args = num_mapped_args
+        with torch._C._AutoDispatchBelowAutograd():
+            # Need to have out and logsumexp returned
+            return templated_attention(query, key, value, fw_graph, *other_buffers)
+
+    @staticmethod
+    def backward(ctx, grad_out, logsumexp_grad):
+        fw_args = ctx.saved_tensors
+        query, key, value, *other_buffers = fw_args
+        fw_graph = ctx._fw_graph
+        joint_graph = ctx._joint_graph
+
+        raise NotImplementedError("Need to implement this")
+        # return flat_grads
+
+        # grads = templated_attention_backward()
+        # grads = map_impl(
+        #     ctx._joint_graph,
+        #     fw_mapped_args + flat_grads,
+        #     pos_args,
+        # )
+        # return *grads
+
+
+@templated_attention.py_impl(DispatchKey.Autograd)
+def templated_attention_autograd(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    score_mod: Callable,
+    *other_buffers: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    input_requires_grad = query.requires_grad or key.requires_grad
+    example_vals = [
+        torch.zeros((), dtype=query.dtype, requires_grad=input_requires_grad)
+    ] + [torch.zeros((), dtype=torch.int) for _ in range(4)]
+    fw_graph, bw_graph = create_fw_bw_graph(score_mod, example_vals, other_buffers)
+    out, logsumexp = TemplatedAttentionAutogradOp.apply(
+        fw_graph, bw_graph, query, key, value, score_mod, *other_buffers
+    )
+    return out, logsumexp
