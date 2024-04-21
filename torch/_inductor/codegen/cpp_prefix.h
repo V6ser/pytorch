@@ -24,6 +24,7 @@
 #include <c10/util/generic_math.h>
 #include <c10/util/Half.h>
 #include <c10/util/TypeCast.h>
+#include <memory>
 
 #if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_ZVECTOR) || defined(CPU_CAPABILITY_NEON)
 #define INDUCTOR_USE_VECTOR_TYPES() 1
@@ -47,6 +48,7 @@ struct Welford {
   T mean = T(0);
   T m2 = T(0);
   T weight = T(0);
+  int64_t index = 0;
 };
 
 
@@ -78,7 +80,8 @@ Welford<T> welford_combine(const Welford<T> &a, const Welford<T> &b) {
   auto result = Welford<T>{
     a.mean + delta * wb_over_w,
     a.m2 + b.m2 + delta * delta * a.weight * wb_over_w,
-    new_weight
+    new_weight,
+    a.index + b.index,
   };
   return result;
 }
@@ -86,6 +89,7 @@ Welford<T> welford_combine(const Welford<T> &a, const Welford<T> &b) {
 template <typename T>
 Welford<T> welford_combine(const Welford<T> &acc, T data) {
   // Add a single data point
+  int64_t index = acc.index + 1;
   auto delta = data - acc.mean;
   auto new_weight = acc.weight + T(1);
   auto new_mean = acc.mean + delta / new_weight;
@@ -93,7 +97,25 @@ Welford<T> welford_combine(const Welford<T> &acc, T data) {
   auto result = Welford<T>{
     new_mean,
     acc.m2 + delta * new_delta,
-    new_weight
+    new_weight,
+    index
+  };
+  return result;
+}
+
+template <typename T>
+Welford<T> welford_combine(const Welford<T> &acc, T data, const std::unique_ptr<T []>& weights_recip) {
+  // Add a single data point
+  int64_t index = acc.index + 1;
+  auto delta = data - acc.mean;
+  auto new_weight = T(index);
+  auto new_mean = acc.mean + delta * weights_recip[acc.index];
+  auto new_delta = data - new_mean;
+  auto result = Welford<T>{
+    new_mean,
+    acc.m2 + delta * new_delta,
+    new_weight,
+    index
   };
   return result;
 }
