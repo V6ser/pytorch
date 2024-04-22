@@ -9,6 +9,8 @@
 # - `torch.nn.Parameter`
 # - `collections.Counter`
 # - `collections.OrderedDict`
+# Additionally, users can allowlist classes they have deemed as safe using
+# `_mark_safe_globals()` (`torch.serialization.mark_safe_globals`)
 
 # Based of https://github.com/python/cpython/blob/main/Lib/pickle.py
 # Expected to be useful for loading PyTorch model weights
@@ -59,10 +61,31 @@ from pickle import (
     UnpicklingError,
 )
 from struct import unpack
-from sys import maxsize
-from typing import Any, Dict, List
+from sys import maxsize, modules
+from typing import Any, Callable, Dict, List
 
 import torch
+
+_marked_safe_globals_list: List[Callable] = []
+
+
+def _mark_safe_globals(safe_globals: List[Callable]):
+    global _marked_safe_globals_list
+    _marked_safe_globals_list += safe_globals
+
+
+# Separate from _get_allowed_globals because of the lru_cache on _get_allowed_globals
+# For example if user had a script like
+#   torch.load(file_a)
+#   torch.serialization._mark_safe_globals([torch.foo])
+#   torch.load(file_b)
+# the dynamic additions to safe_globals would not be picked up by
+# _get_allowed_globals due to the lru_cache
+def _get_user_allowed_globals():
+    rc: Dict[str, Any] = {}
+    for f in _marked_safe_globals_list:
+        rc[f"{f.__module__}.{f.__name__}"] = f
+    return rc
 
 
 # Unpickling machinery
@@ -75,6 +98,7 @@ def _get_allowed_globals():
         "torch.serialization._get_layout": torch.serialization._get_layout,
         "torch.Size": torch.Size,
         "torch.Tensor": torch.Tensor,
+        "torch.device": torch.device,
     }
     # dtype
     for t in torch.storage._dtype_to_storage_type_map().keys():
@@ -113,6 +137,7 @@ def _get_allowed_globals():
         torch._utils._rebuild_sparse_tensor,
         torch._utils._rebuild_meta_tensor_no_storage,
         torch._utils._rebuild_nested_tensor,
+        torch._utils._rebuild_wrapper_subclass,
     ]:
         rc[f"torch._utils.{f.__name__}"] = f
 
@@ -151,8 +176,31 @@ class Unpickler:
                 full_path = f"{module}.{name}"
                 if full_path in _get_allowed_globals():
                     self.append(_get_allowed_globals()[full_path])
+                elif full_path in _get_user_allowed_globals():
+                    self.append(_get_user_allowed_globals()[full_path])
                 else:
-                    raise RuntimeError(f"Unsupported class {full_path}")
+                    class_type = getattr(modules[module], name)
+                    if issubclass(class_type, torch.Tensor):
+                        # __setstate__ is called by `_rebuild_from_type_v2`
+                        custom_set_state = (
+                            getattr(
+                                class_type, "__setstate__", torch.Tensor.__setstate__
+                            )
+                            is not torch.Tensor.__setstate__
+                        )
+                        # tp_alloc is called by `Tensor._rebuild_wrapper_subclass` and `Tensor.as_subclass`
+                        custom_tp_alloc = not torch._C._check_tp_alloc_is_default(
+                            class_type
+                        )
+                        if custom_set_state or custom_tp_alloc:
+                            raise RuntimeError(
+                                f"Trying to unpickle tensor subclass {full_path} that has defined a custom "
+                                "__setstate__ and/or tp_alloc. Please check whether these methods are safe "
+                                "and allowlist them with torch.serialization.mark_safe_globals if so."
+                            )
+                        self.append(class_type)
+                    else:
+                        raise RuntimeError(f"Unsupported class {full_path}")
             elif key[0] == NEWOBJ[0]:
                 args = self.stack.pop()
                 cls = self.stack.pop()
@@ -162,7 +210,10 @@ class Unpickler:
             elif key[0] == REDUCE[0]:
                 args = self.stack.pop()
                 func = self.stack[-1]
-                if func not in _get_allowed_globals().values():
+                if (
+                    func not in _get_allowed_globals().values()
+                    and func not in _get_user_allowed_globals().values()
+                ):
                     raise RuntimeError(
                         f"Trying to call reduce for unrecognized function {func}"
                     )
