@@ -1459,6 +1459,10 @@ def load_aoti_eager_cache(
                 # Convert string to list for sizes and strides to make C++ vector parser easier
                 meta_info["sizes"] = ast.literal_eval(meta_info["sizes"])
                 meta_info["strides"] = ast.literal_eval(meta_info["strides"])
+                if "scalar_value" in meta_info:
+                    meta_info["scalar_value"] = ast.literal_eval(
+                        meta_info["scalar_value"]
+                    )
 
         return json_data
 
@@ -1481,16 +1485,23 @@ def aoti_compile_with_persistent_cache(
     """
     Compile the given function with persistent cache for AOTI eager mode.
     """
-    flattened_inputs = pytree.arg_tree_leaves(*args, **kwargs)
-    assert all(
-        isinstance(input, torch.Tensor) for input in flattened_inputs
-    ), "Only support static shape for now"
     assert not dynamic, "Only support static shape for now"
+    type_to_torch_dtype = {int: torch.int32, float: torch.float, bool: torch.bool}
+    supported_scalar_types = tuple(type_to_torch_dtype.keys())
+    flattened_inputs = pytree.arg_tree_leaves(*args, **kwargs)
+    if not all(
+        isinstance(input, (supported_scalar_types, torch.Tensor))
+        for input in flattened_inputs
+    ):
+        raise NotImplementedError("Only support tensor, int, float, bool for now")
 
     persistent_cache = aoti_eager_cache_dir() / ns.lower() / device_type.lower()
-    persistent_cache.mkdir(parents=True, exist_ok=True)
+    if not persistent_cache.exists():
+        persistent_cache.mkdir(parents=True)
+
     persistent_cache_lib = persistent_cache / "lib"
-    persistent_cache_lib.mkdir(parents=True, exist_ok=True)
+    if not persistent_cache_lib.exists():
+        persistent_cache_lib.mkdir()
 
     with mock.patch.dict(
         os.environ,
@@ -1512,18 +1523,31 @@ def aoti_compile_with_persistent_cache(
             )
 
             kernel_meta_info_items = []
-            for input_tensor in flattened_inputs:
+            for input in flattened_inputs:
                 # TODO(Eiakn): To add dynamic support
                 meta_info_item = {}
                 meta_info_item["is_dynamic"] = f"{dynamic}"
-                meta_info_item["device_type"] = f"{input_tensor.device.type}"
-                if is_cpu_device([input_tensor]):
-                    meta_info_item["device_index"] = "-1"
+
+                if isinstance(input, torch.Tensor):
+                    meta_info_item["device_type"] = f"{input.device.type}"
+                    if is_cpu_device([input]):
+                        meta_info_item["device_index"] = "-1"
+                    else:
+                        meta_info_item["device_index"] = f"{input.device.index}"
+                    meta_info_item["dtype"] = f"{input.dtype}"
+                    meta_info_item["sizes"] = f"{list(input.size())}"
+                    meta_info_item["strides"] = f"{list(input.stride())}"
                 else:
-                    meta_info_item["device_index"] = f"{input_tensor.device.index}"
-                meta_info_item["dtype"] = f"{input_tensor.dtype}"
-                meta_info_item["sizes"] = f"{list(input_tensor.size())}"
-                meta_info_item["strides"] = f"{list(input_tensor.stride())}"
+                    assert isinstance(input, supported_scalar_types)
+                    # Scalar tensor
+                    meta_info_item["device_type"] = device_type.lower()
+                    meta_info_item["device_index"] = (
+                        "-1" if device_type.lower() == "cpu" else "0"
+                    )
+                    meta_info_item["dtype"] = f"{type_to_torch_dtype[type(input)]}"
+                    meta_info_item["sizes"] = "[]"
+                    meta_info_item["strides"] = "[]"
+                    meta_info_item["scalar_value"] = f"{input}"
                 kernel_meta_info_items.append(meta_info_item)
 
             kernel_meta_info: Dict[str, Any] = {}

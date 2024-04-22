@@ -133,14 +133,53 @@ bool unpack_tensors(
     const std::vector<c10::Argument>& arguments,
     const torch::jit::Stack& stack,
     const c10::Device& device,
-    std::vector<at::Tensor>& inputs) {
+    std::vector<at::Tensor>& inputs,
+    bool with_scalar = false) {
   for (size_t idx = 0; idx < stack.size(); idx++) {
+    if (!with_scalar && stack[idx].isScalar()) {
+      continue;
+    }
+
     if (!unpack_ivalue(arguments[idx], stack[idx], device, inputs)) {
       return false;
     }
   }
 
   return true;
+}
+
+std::vector<size_t> get_tensor_paramter_index(
+    const std::vector<c10::Argument>& arguments,
+    const torch::jit::Stack& stack) {
+  std::vector<size_t> tensor_parameter_index;
+  for (size_t idx = 0; idx < stack.size(); idx++) {
+    if (stack[idx].isScalar() || stack[idx].isTensor()) {
+      // scalar and tensor
+      tensor_parameter_index.push_back(idx);
+    } else if (stack[idx].isTensorList()) {
+      // tensor list
+      std::fill_n(
+        std::back_inserter(tensor_parameter_index),
+        stack[idx].toListRef().size(),
+        idx);
+    } else if (stack[idx].isOptionalTensorList()) {
+      // optional tensor list: std::vector<std::optional<at::Tensor>>
+      for (const auto& item : stack[idx].toListRef()) {
+        if (item.toOptional<at::Tensor>().has_value()) {
+          tensor_parameter_index.push_back(idx);
+        }
+      }
+    } else if (
+        *arguments[idx].real_type() ==
+        *c10::getTypePtr<c10::optional<at::Tensor>>()) {
+      // optional tensor
+      if (stack[idx].toOptional<at::Tensor>().has_value()) {
+        tensor_parameter_index.push_back(idx);
+      }
+    }
+  }
+
+  return tensor_parameter_index;
 }
 
 } // namespace
@@ -195,17 +234,22 @@ bool AOTIPythonKernelHolder::cache_lookup(
   auto arg = return_arguments[0];
   // Only support return single tensor.
   // TODO: Extend scope to support tensor vector
-  if (!arg.type()->isSubtypeOf(c10::TensorType::get())) {
+  if (!arg.type()->isSubtypeOf(*c10::TensorType::get())) {
     return false;
   }
 
   std::vector<at::Tensor> inputs;
-  auto res = unpack_tensors(op.schema().arguments(), *stack, device_, inputs);
+  auto res = unpack_tensors(
+      op.schema().arguments(), *stack, device_, inputs, true /*with scalar*/);
   if (!res || inputs.empty()) {
     return false;
   }
 
-  auto inputs_meta_info = get_inputs_meta_info(inputs);
+  auto tensor_parameter_index =
+      get_tensor_paramter_index(op.schema().arguments(), *stack);
+  TORCH_INTERNAL_ASSERT(tensor_parameter_index.size() == inputs.size());
+  auto inputs_meta_info = get_inputs_meta_info(
+      inputs, op.schema().arguments(), tensor_parameter_index);
   auto aoti_kernel_state = aoti_kernel_cache_.find(inputs_meta_info);
   if (aoti_kernel_state == aoti_kernel_cache_.end()) {
     return false;
@@ -246,18 +290,49 @@ void AOTIPythonKernelHolder::cache_hit(
 }
 
 AOTIKernelMetaInfo AOTIPythonKernelHolder::get_inputs_meta_info(
-    const std::vector<at::Tensor>& inputs) {
+    const std::vector<at::Tensor>& inputs,
+    const std::vector<c10::Argument>& inputs_argument,
+    const std::vector<size_t>& inputs_argument_index) {
   AOTIKernelMetaInfo inputs_meta_info;
-  for (const auto& input : inputs) {
+  for (size_t idx = 0; idx < inputs.size(); ++idx) {
+    auto input = inputs[idx];
+    auto input_info = inputs_argument[inputs_argument_index[idx]];
+
     auto device = input.device();
     if (device.is_cpu()) {
       // If the device is CPU, set the device index to -1.
       device = c10::Device(device.type(), -1);
     }
 
+    c10::Scalar scalar_value((double)1.0);
+    auto tensor_type = input.scalar_type();
+
+    bool is_scalar = input_info.type()->isSubtypeOf(*c10::NumberType::get());
+    if (is_scalar) {
+      if (c10::isFloatingType(input.scalar_type())) {
+        auto scalar_numeric_value = input.item().toDouble();
+        tensor_type = c10::ScalarType::Double;
+        scalar_value = c10::Scalar(scalar_numeric_value);
+      } else if (c10::isIntegralType(input.scalar_type(), false)) {
+        auto scalar_numeric_value = input.item().toUInt64();
+        tensor_type = c10::ScalarType::UInt64;
+        scalar_value = c10::Scalar(scalar_numeric_value);
+      } else if (input.scalar_type() == c10::ScalarType::Bool) {
+        auto scalar_numeric_value = input.item().toBool();
+        tensor_type = c10::ScalarType::Bool;
+        scalar_value = c10::Scalar(scalar_numeric_value);
+      } else {
+        TORCH_CHECK(
+            false,
+            "Unsupported scalar tensor type: ",
+            c10::toString(input.scalar_type()));
+      }
+    }
+
     inputs_meta_info.emplace_back(
-        false, // is symbloic
-        input.scalar_type(),
+        false,
+        tensor_type,
+        c10::IValue(scalar_value),
         device,
         input.sym_sizes().vec(),
         input.sym_strides().vec());
@@ -315,6 +390,7 @@ void AOTIPythonKernelHolder::init_aoti_kernel_cache() {
       auto dtype = meta_info_dict["dtype"].cast<std::string>();
       auto sizes = meta_info_dict["sizes"].cast<std::vector<int64_t>>();
       auto strides = meta_info_dict["strides"].cast<std::vector<int64_t>>();
+      bool is_scalar = meta_info_dict.contains("scalar_value");
 
       std::vector<c10::SymInt> sym_sizes;
       std::vector<c10::SymInt> sym_strides;
@@ -329,10 +405,38 @@ void AOTIPythonKernelHolder::init_aoti_kernel_cache() {
         sym_optional_strides.push_back(std::optional<c10::SymInt>(stride));
       }
 
-      // Now you can use these variables in your code
+      auto tensor_dtype = parse_dtype(dtype);
+      // If an input parameter is a scalar, its detailed value is cached.
+      // This is done to ensure correctness during subsequent checks.
+      c10::Scalar scalar_value((double)1.0);
+      if (is_scalar) {
+        if (c10::isFloatingType(tensor_dtype)) {
+          auto scalar_numeric_value =
+              meta_info_dict["scalar_value"].cast<double>();
+          tensor_dtype = c10::ScalarType::Double;
+          scalar_value = c10::Scalar(scalar_numeric_value);
+        } else if (c10::isIntegralType(tensor_dtype, false)) {
+          auto scalar_numeric_value =
+              meta_info_dict["scalar_value"].cast<int64_t>();
+          tensor_dtype = c10::ScalarType::UInt64;
+          scalar_value = c10::Scalar(scalar_numeric_value);
+        } else if (tensor_dtype == c10::ScalarType::Bool) {
+          auto scalar_numeric_value =
+              meta_info_dict["scalar_value"].cast<bool>();
+          tensor_dtype = c10::ScalarType::Bool;
+          scalar_value = c10::Scalar(scalar_numeric_value);
+        } else {
+          TORCH_CHECK(
+              false,
+              "Unsupported scalar tensor type: ",
+              c10::toString(tensor_dtype));
+        }
+      }
+
       tensor_meta_info_list.emplace_back(
           is_dynamic,
-          parse_dtype(dtype),
+          tensor_dtype,
+          c10::IValue(scalar_value),
           c10::Device(c10::Device(device_type).type(), device_index),
           sym_sizes,
           sym_strides);
@@ -340,7 +444,7 @@ void AOTIPythonKernelHolder::init_aoti_kernel_cache() {
           state,
           nullptr,
           uint64_t(c10::DispatchKeySet(dispatch_key_).raw_repr()),
-          parse_dtype(dtype),
+          tensor_dtype,
           c10::DeviceIndex(device_index),
           sym_optional_sizes,
           sym_optional_strides);
