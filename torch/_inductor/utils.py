@@ -47,6 +47,7 @@ from typing_extensions import Concatenate, ParamSpec
 import torch
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.utils import detect_fake_mode
+from torch._guards import TracingContext
 from torch.autograd import DeviceType
 from torch.autograd.profiler_util import EventList
 from torch.fx.passes.shape_prop import ShapeProp
@@ -57,6 +58,8 @@ log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 VarRanges = Dict[sympy.Expr, sympy.Expr]
+
+ALIGNMENT = 16
 
 
 def do_bench_using_profiling(fn: Callable[[], Any], warmup=25, rep=100) -> float:
@@ -1588,3 +1591,23 @@ def dump_node_schedule(node_schedule):
                 print(dep)
         else:
             raise RuntimeError(f"Unrecognized node type: {type(node)}")
+
+
+def tensor_is_aligned(tensor: torch.Tensor):
+    # See Note: [Input Alignment handling in Inductor]
+    # Right now, we don't try to guard on the alignment of the storage offset.
+    # When this comment was written, non-symbolic storage_offsets are not guarded on
+    # but symbolic storage_offsets are. For consistency, we suppress guard creation
+    # upon performing this check: that ensures that we don't add recompiles when we
+    # add this logic.
+    with TracingContext.get().fake_mode.shape_env.suppress_guards():
+        return bool((tensor.storage_offset() * get_dtype_size(tensor.dtype)) % ALIGNMENT == 0)
+
+
+def should_assume_input_aligned(example_input: torch.Tensor):
+    # See Note: [Input Alignment handling in Inductor]
+
+    # right now, we only care about alignment for cuda tensors.
+    if example_input.device.type != "cuda":
+        return False
+    return config.assume_aligned_inputs or tensor_is_aligned(example_input)
