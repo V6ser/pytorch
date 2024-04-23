@@ -4,10 +4,28 @@
 import argparse
 import os
 import sys
+import glob
+
+def convert_path_to_windows(*paths):
+    """Converts a path or multiple path segments to Windows format."""
+    joined_path = os.path.join(*paths)
+    return os.path.normpath(joined_path)
+
+def trace(frame, event, arg):
+    if event == "call":
+        filename = frame.f_code.co_filename
+        if filename == "L:/Pitao/pytorch/tools/amd_build/build_amd.py":
+            lineno = frame.f_lineno
+            # Here I'm printing the file and line number, 
+            # but you can examine the frame, locals, etc too.
+            print("%s @ %s" % (filename, lineno))
+    return trace
+
+sys.settrace(trace)
 
 sys.path.append(
     os.path.realpath(
-        os.path.join(
+        convert_path_to_windows(
             __file__, os.path.pardir, os.path.pardir, os.path.pardir, "torch", "utils"
         )
     )
@@ -52,7 +70,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 amd_build_dir = os.path.dirname(os.path.realpath(__file__))
-proj_dir = os.path.join(os.path.dirname(os.path.dirname(amd_build_dir)))
+proj_dir = convert_path_to_windows(os.path.dirname(os.path.dirname(amd_build_dir)))
 
 if args.project_directory:
     proj_dir = args.project_directory
@@ -107,12 +125,17 @@ includes = [
     "tools/autograd/templates/python_variable_methods.cpp",
 ]
 
-includes = [os.path.join(proj_dir, include) for include in includes]
+includes+=[
+"c10/cuda/test/CMakeLists.txt",
+"aten/src/ATen/cuda/CUDAConfig.h",
+]
+
+includes = [convert_path_to_windows(proj_dir, include) for include in includes]
 
 for new_dir in args.extra_include_dir:
-    abs_new_dir = os.path.join(proj_dir, new_dir)
+    abs_new_dir = convert_path_to_windows(proj_dir, new_dir)
     if os.path.exists(abs_new_dir):
-        abs_new_dir = os.path.join(abs_new_dir, "**/*")
+        abs_new_dir = convert_path_to_windows(abs_new_dir, "**/*")
         includes.append(abs_new_dir)
 
 ignores = [
@@ -123,7 +146,7 @@ ignores = [
     "aten/src/ATen/core/*",
     # Correct path to generate HIPConfig.h:
     #   CUDAConfig.h.in -> (amd_build) HIPConfig.h.in -> (cmake) HIPConfig.h
-    "aten/src/ATen/cuda/CUDAConfig.h",
+    #"aten/src/ATen/cuda/CUDAConfig.h",
     "third_party/nvfuser/csrc/codegen.cpp",
     "third_party/nvfuser/runtime/block_reduction.cu",
     "third_party/nvfuser/runtime/block_sync_atomic.cu",
@@ -138,13 +161,13 @@ ignores = [
     "torch/include/*",
 ]
 
-ignores = [os.path.join(proj_dir, ignore) for ignore in ignores]
+ignores = [convert_path_to_windows(proj_dir, ignore) for ignore in ignores]
 
 
 # Check if the compiler is hip-clang.
 def is_hip_clang() -> bool:
     try:
-        hip_path = os.getenv("HIP_PATH", "/opt/rocm/hip")
+        hip_path = os.getenv("HIP_PATH", "C:/hip")
         with open(hip_path + "/lib/.hipInfo") as f:
             return "HIP_COMPILER=clang" in f.read()
     except OSError:
@@ -199,8 +222,9 @@ hipify_python.hipify(
     project_directory=proj_dir,
     output_directory=out_dir,
     includes=includes,
-    ignores=ignores,
+    ignores="",
     extra_files=["torch/_inductor/codegen/wrapper.py"],
     out_of_place_only=args.out_of_place_only,
     hip_clang_launch=is_hip_clang(),
 )
+sys.settrace(None)
