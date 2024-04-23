@@ -33,6 +33,8 @@ aten/build/
 aten/src/ATen/Config.h
 aten/src/ATen/cuda/CUDAConfig.h
 benchmarks/.data
+build/
+@build/
 caffe2/cpp_test/
 dist/
 docs/build/
@@ -375,3 +377,10 @@ android/pytorch_android_torchvision/.cxx
 .arcconfig
 .stable_pyre_client
 .pyre_client
+/out
+CMakeSettings.json
+/c10/-hip
+BuildPyTorchOnPlainUbuntuAndCentOS.sh
+cmake/Modules/FindHIP.cmake
+/cmake/Modules/FindHIP
+cmake/public/@LoadHIP.cmake

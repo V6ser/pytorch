@@ -4,7 +4,7 @@ RANLIB = ranlib
 LIBSRC = src/libopencl.c
 LIBOBJ=$(LIBSRC:.c=.o)
 
-CFLAGS = -O2 -fPIC -I ./include -Wall
+CFLAGS = -O2 -I ./include -Wall
 
 LIBOPENCL = libOpenCL.a
 TARGETS = $(LIBOPENCL)

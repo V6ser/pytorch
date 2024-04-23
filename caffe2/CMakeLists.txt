@@ -53,7 +53,7 @@ endif()
 # ---[ ATen build
 if(INTERN_BUILD_ATEN_OPS)
   set(__caffe2_CMAKE_POSITION_INDEPENDENT_CODE ${CMAKE_POSITION_INDEPENDENT_CODE})
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
   add_subdirectory(../aten aten)
   set(CMAKE_POSITION_INDEPENDENT_CODE ${__caffe2_CMAKE_POSITION_INDEPENDENT_CODE})
 
@@ -1324,10 +1324,11 @@ if(USE_ROCM)
     __HIP_PLATFORM_AMD__
     )
   target_include_directories(torch_hip PRIVATE
-    /opt/rocm/include
-    /opt/rocm/hcc/include
-    /opt/rocm/rocblas/include
-    /opt/rocm/hipsparse/include
+    c:/hip/cmake
+    c:/hip/include
+    c:/hip/bin
+    c:/hip/bin/rocblas/library
+    c:/hip/lib/cmake/hipsparse
     )
   if(USE_FLASH_ATTENTION)
     target_compile_definitions(torch_hip PRIVATE USE_FLASH_ATTENTION)
