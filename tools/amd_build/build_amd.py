@@ -16,8 +16,6 @@ def trace(frame, event, arg):
         filename = frame.f_code.co_filename
         if filename == "L:/Pitao/pytorch/tools/amd_build/build_amd.py":
             lineno = frame.f_lineno
-            # Here I'm printing the file and line number, 
-            # but you can examine the frame, locals, etc too.
             print("%s @ %s" % (filename, lineno))
     return trace
 
